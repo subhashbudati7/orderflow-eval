@@ -1,0 +1,20 @@
+# java
+environment/order-service/target/
+*.class
+*.log
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# grader output
+results/runs/
+results/last-run/
+
+# editors / os
+.idea/
+*.iml
+.vscode/
+.DS_Store

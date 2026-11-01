@@ -1,0 +1,28 @@
+{
+  "note": "Replaces the self-invoked @CacheEvict with a direct CacheManager call. Cache scenario passes, nothing else fixed.",
+  "patch": "patches/incomplete/04-cache-only.patch",
+  "expected": {
+    "passed": false,
+    "must_fail": [
+      "IDEM-01",
+      "IDEM-05",
+      "ORD-01",
+      "ORD-02",
+      "ORD-03"
+    ],
+    "must_pass": [
+      "CACHE-01",
+      "IDEM-02",
+      "IDEM-03",
+      "IDEM-04",
+      "ORD-04",
+      "ORD-05",
+      "ORD-06",
+      "CACHE-02",
+      "CACHE-03",
+      "API-01",
+      "API-02",
+      "UNIT-01"
+    ]
+  }
+}

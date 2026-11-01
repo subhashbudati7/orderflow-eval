@@ -1,0 +1,17 @@
+diff --git a/src/main/java/com/orderflow/service/OrderStatusService.java b/src/main/java/com/orderflow/service/OrderStatusService.java
+index 873c63e..4eb6aef 100644
+--- a/src/main/java/com/orderflow/service/OrderStatusService.java
++++ b/src/main/java/com/orderflow/service/OrderStatusService.java
+@@ -39,6 +39,12 @@ public class OrderStatusService {
+         Order order = orders.findById(event.orderId())
+                 .orElseThrow(() -> new OrderNotFoundException(event.orderId()));
+ 
++        if (event.sequence() <= order.getLastEventSequence()) {
++            log.info("ignoring status event seq {} for order {} (already at {})",
++                    event.sequence(), order.getId(), order.getLastEventSequence());
++            return;
++        }
++
+         Instant now = clock.instant();
+         order.applyStatus(event.status(), event.sequence(), event.occurredAt(), now);
+         orders.save(order);

@@ -1,0 +1,37 @@
+{
+  "task_id": "orderflow-ord-2291",
+  "version": 1,
+  "title": "Fix duplicate orders, out-of-order status events and stale cache in order-service",
+  "repository": "environment/order-service",
+  "working_directory": "environment/order-service",
+  "bug_report": "environment/BUG_REPORT.md",
+  "documentation": [
+    "environment/order-service/README.md",
+    "environment/order-service/docs/API.md",
+    "environment/order-service/docs/ARCHITECTURE.md",
+    "environment/order-service/tools/README.md"
+  ],
+  "prompt": "You are working in environment/order-service, a Spring Boot service. Read environment/BUG_REPORT.md (ticket ORD-2291) and the docs it points to, then fix the service so the three reported symptoms no longer happen. Constraints: keep every behaviour documented in docs/API.md and docs/ARCHITECTURE.md; existing unit tests must keep passing (you may extend them); schema changes go in a new Flyway migration; do not change the Kafka producers, the compose file or the docs. You can run `mvn -q test` for unit tests and `docker compose up -d --build` from environment/ for the full stack; tools/send_status.py publishes status events. When you are done, make sure `mvn -q test` is green and summarise what was wrong and what you changed.",
+  "allowed_tools": ["shell", "file_read", "file_write", "docker"],
+  "network": "package registries only",
+  "budget": {
+    "wall_clock_minutes": 60,
+    "max_turns": 150,
+    "notes": "Record the actual budget used per attempt in results/attempts/."
+  },
+  "deliverable": "a git diff of environment/order-service against the shipped tree",
+  "grading": {
+    "command": "cd grader && python run_grader.py --source <agent environment dir> --label <attempt id>",
+    "pass_condition": "summary.passed == true: every bug scenario passes and no contract scenario regresses",
+    "scenarios": "grader/grader/scoring.py",
+    "reference_solutions": ["patches/reference.patch", "patches/alt-fix.patch"]
+  },
+  "known_traps": [
+    "returning 409 for a concurrent retry instead of the documented 200 + Idempotent-Replayed",
+    "enforcing a status state machine; CANCELLED after SHIPPED and PAID -> SHIPPED are both valid",
+    "fixing the self-invocation @CacheEvict but evicting before the transaction commits",
+    "using < instead of <= in the sequence guard",
+    "publishing OrderCreated inside the transaction before the row is committed",
+    "editing V1__orders.sql instead of adding V2"
+  ]
+}

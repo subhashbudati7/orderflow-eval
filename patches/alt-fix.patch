@@ -1,0 +1,372 @@
+diff --git a/src/main/java/com/orderflow/domain/OrderRepository.java b/src/main/java/com/orderflow/domain/OrderRepository.java
+index db5b7ca..930bdbd 100644
+--- a/src/main/java/com/orderflow/domain/OrderRepository.java
++++ b/src/main/java/com/orderflow/domain/OrderRepository.java
+@@ -1,11 +1,43 @@
+ package com.orderflow.domain;
+ 
+ import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Modifying;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
+ 
++import java.time.Instant;
+ import java.util.Optional;
+ import java.util.UUID;
+ 
+ public interface OrderRepository extends JpaRepository<Order, UUID> {
+ 
+     Optional<Order> findByIdempotencyKey(String idempotencyKey);
++
++    /**
++     * Transaction-scoped advisory lock on the key. Concurrent creates for the
++     * same key queue up behind each other instead of racing find-then-insert.
++     * Released automatically at commit/rollback.
++     */
++    @Query(value = "SELECT pg_advisory_xact_lock(hashtext(:key)) IS NULL", nativeQuery = true)
++    Boolean lockIdempotencyKey(@Param("key") String key);
++
++    /**
++     * Applies a status event only if it is newer than what the row already has.
++     * Returns 0 when the event was late or a redelivery.
++     */
++    @Modifying(clearAutomatically = true)
++    @Query("""
++            UPDATE Order o
++               SET o.status = :status,
++                   o.lastEventSequence = :sequence,
++                   o.statusUpdatedAt = :occurredAt,
++                   o.updatedAt = :now
++             WHERE o.id = :id
++               AND o.lastEventSequence < :sequence
++            """)
++    int applyStatusIfNewer(@Param("id") UUID id,
++                           @Param("status") OrderStatus status,
++                           @Param("sequence") long sequence,
++                           @Param("occurredAt") Instant occurredAt,
++                           @Param("now") Instant now);
+ }
+diff --git a/src/main/java/com/orderflow/service/OrderCacheRefresher.java b/src/main/java/com/orderflow/service/OrderCacheRefresher.java
+new file mode 100644
+index 0000000..ecdfbd2
+--- /dev/null
++++ b/src/main/java/com/orderflow/service/OrderCacheRefresher.java
+@@ -0,0 +1,47 @@
++package com.orderflow.service;
++
++import com.orderflow.api.OrderResponse;
++import com.orderflow.domain.OrderRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.cache.Cache;
++import org.springframework.cache.CacheManager;
++import org.springframework.stereotype.Component;
++import org.springframework.transaction.annotation.Propagation;
++import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.event.TransactionPhase;
++import org.springframework.transaction.event.TransactionalEventListener;
++
++/**
++ * Write-through refresh of the orders cache. Runs after the status
++ * transaction commits, reads the committed row, and overwrites the cached
++ * entry so the next GET is correct without waiting for a miss.
++ */
++@Component
++public class OrderCacheRefresher {
++
++    private static final Logger log = LoggerFactory.getLogger(OrderCacheRefresher.class);
++
++    private final OrderRepository orders;
++    private final CacheManager cacheManager;
++
++    public OrderCacheRefresher(OrderRepository orders, CacheManager cacheManager) {
++        this.orders = orders;
++        this.cacheManager = cacheManager;
++    }
++
++    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
++    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
++    public void onStatusApplied(OrderStatusApplied applied) {
++        Cache cache = cacheManager.getCache(OrderQueryService.ORDERS_CACHE);
++        if (cache == null) {
++            return;
++        }
++        orders.findById(applied.orderId()).ifPresentOrElse(
++                order -> {
++                    cache.put(order.getId(), OrderResponse.from(order));
++                    log.debug("refreshed cached order {}", order.getId());
++                },
++                () -> cache.evict(applied.orderId()));
++    }
++}
+diff --git a/src/main/java/com/orderflow/service/OrderService.java b/src/main/java/com/orderflow/service/OrderService.java
+index 9d71bee..e714d35 100644
+--- a/src/main/java/com/orderflow/service/OrderService.java
++++ b/src/main/java/com/orderflow/service/OrderService.java
+@@ -8,6 +8,8 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+@@ -32,6 +34,10 @@ public class OrderService {
+     public CreateOrderResult createOrder(String idempotencyKey, CreateOrderRequest request) {
+         String fingerprint = RequestFingerprint.of(request);
+ 
++        // Serialize creates per key for the rest of this transaction. The unique
++        // constraint from V2 is the backstop if anything bypasses this path.
++        orders.lockIdempotencyKey(idempotencyKey);
++
+         Optional<Order> existing = orders.findByIdempotencyKey(idempotencyKey);
+         if (existing.isPresent()) {
+             Order found = existing.get();
+@@ -45,14 +51,26 @@ public class OrderService {
+         Instant now = clock.instant();
+         Order order = Order.create(request.customerId(), idempotencyKey, fingerprint,
+                 request.totalCents(), request.currency(), now);
++        orders.save(order);
+ 
+-        // Downstream (fulfillment, notifications) must hear about the order before
+-        // we answer the client, otherwise a fast follow-up status event can arrive
+-        // for an order nobody knows about yet.
+-        publisher.publishOrderCreated(order);
++        // Kafka is outside the DB transaction. Announce the order only once the
++        // row is committed, otherwise a rollback leaves downstream with a ghost.
++        runAfterCommit(() -> publisher.publishOrderCreated(order));
+ 
+-        orders.save(order);
+         log.info("created order {} for customer {}", order.getId(), order.getCustomerId());
+         return CreateOrderResult.created(order);
+     }
++
++    private static void runAfterCommit(Runnable action) {
++        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
++            action.run();
++            return;
++        }
++        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++            @Override
++            public void afterCommit() {
++                action.run();
++            }
++        });
++    }
+ }
+diff --git a/src/main/java/com/orderflow/service/OrderStatusApplied.java b/src/main/java/com/orderflow/service/OrderStatusApplied.java
+new file mode 100644
+index 0000000..a9dfbe7
+--- /dev/null
++++ b/src/main/java/com/orderflow/service/OrderStatusApplied.java
+@@ -0,0 +1,7 @@
++package com.orderflow.service;
++
++import java.util.UUID;
++
++/** In-process signal that an order row changed status in the current transaction. */
++public record OrderStatusApplied(UUID orderId) {
++}
+diff --git a/src/main/java/com/orderflow/service/OrderStatusService.java b/src/main/java/com/orderflow/service/OrderStatusService.java
+index 873c63e..8698f24 100644
+--- a/src/main/java/com/orderflow/service/OrderStatusService.java
++++ b/src/main/java/com/orderflow/service/OrderStatusService.java
+@@ -1,19 +1,17 @@
+ package com.orderflow.service;
+ 
+-import com.orderflow.domain.Order;
+ import com.orderflow.domain.OrderRepository;
+ import com.orderflow.domain.OrderStatusHistory;
+ import com.orderflow.domain.OrderStatusHistoryRepository;
+ import com.orderflow.messaging.OrderStatusEvent;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+-import org.springframework.cache.annotation.CacheEvict;
++import org.springframework.context.ApplicationEventPublisher;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+-import java.util.UUID;
+ 
+ /**
+  * Applies status events coming from fulfillment to the order row and records
+@@ -26,33 +24,39 @@ public class OrderStatusService {
+ 
+     private final OrderRepository orders;
+     private final OrderStatusHistoryRepository history;
++    private final ApplicationEventPublisher events;
+     private final Clock clock;
+ 
+-    public OrderStatusService(OrderRepository orders, OrderStatusHistoryRepository history, Clock clock) {
++    public OrderStatusService(OrderRepository orders, OrderStatusHistoryRepository history,
++                              ApplicationEventPublisher events, Clock clock) {
+         this.orders = orders;
+         this.history = history;
++        this.events = events;
+         this.clock = clock;
+     }
+ 
+     @Transactional
+     public void applyStatusUpdate(OrderStatusEvent event) {
+-        Order order = orders.findById(event.orderId())
+-                .orElseThrow(() -> new OrderNotFoundException(event.orderId()));
++        if (!orders.existsById(event.orderId())) {
++            throw new OrderNotFoundException(event.orderId());
++        }
+ 
+         Instant now = clock.instant();
+-        order.applyStatus(event.status(), event.sequence(), event.occurredAt(), now);
+-        orders.save(order);
+-
+-        history.save(new OrderStatusHistory(order.getId(), event.status(), event.sequence(),
++        // One conditional UPDATE decides whether this event is newer than the row.
++        // No read-modify-write, so two consumer threads can't both think they won.
++        int updated = orders.applyStatusIfNewer(event.orderId(), event.status(), event.sequence(),
++                event.occurredAt(), now);
++        if (updated == 0) {
++            log.info("ignoring late or duplicate status event seq {} ({}) for order {}",
++                    event.sequence(), event.status(), event.orderId());
++            return;
++        }
++
++        history.save(new OrderStatusHistory(event.orderId(), event.status(), event.sequence(),
+                 event.occurredAt(), now, event.source()));
+ 
+-        evictCachedOrder(order.getId());
+-        log.info("order {} -> {} (seq {})", order.getId(), event.status(), event.sequence());
+-    }
+-
+-    @CacheEvict(value = OrderQueryService.ORDERS_CACHE, key = "#orderId")
+-    public void evictCachedOrder(UUID orderId) {
+-        // Eviction is handled by the annotation; nothing else to do here.
+-        log.debug("evicted cached order {}", orderId);
++        // OrderCacheRefresher picks this up after commit and rewrites the cache entry.
++        events.publishEvent(new OrderStatusApplied(event.orderId()));
++        log.info("order {} -> {} (seq {})", event.orderId(), event.status(), event.sequence());
+     }
+ }
+diff --git a/src/main/resources/db/migration/V2__unique_idempotency_key.sql b/src/main/resources/db/migration/V2__unique_idempotency_key.sql
+new file mode 100644
+index 0000000..82e0dd1
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__unique_idempotency_key.sql
+@@ -0,0 +1,2 @@
++DROP INDEX IF EXISTS idx_orders_idempotency_key;
++ALTER TABLE orders ADD CONSTRAINT orders_idempotency_key_unique UNIQUE (idempotency_key);
+diff --git a/src/test/java/com/orderflow/service/OrderServiceTest.java b/src/test/java/com/orderflow/service/OrderServiceTest.java
+index e27fb31..cb18469 100644
+--- a/src/test/java/com/orderflow/service/OrderServiceTest.java
++++ b/src/test/java/com/orderflow/service/OrderServiceTest.java
+@@ -60,6 +60,19 @@ class OrderServiceTest {
+         verify(orders).save(result.order());
+     }
+ 
++    @Test
++    void takesTheKeyLockBeforeLookingUp() {
++        when(orders.findByIdempotencyKey("k1")).thenReturn(Optional.empty());
++        when(orders.save(any())).thenAnswer(inv -> inv.getArgument(0));
++
++        service.createOrder("k1", request);
++
++        var inOrder = org.mockito.Mockito.inOrder(orders);
++        inOrder.verify(orders).lockIdempotencyKey("k1");
++        inOrder.verify(orders).findByIdempotencyKey("k1");
++        inOrder.verify(orders).save(any());
++    }
++
+     @Test
+     void sameKeySameBodyReplaysWithoutPublishing() {
+         Order existing = Order.create("cust-7", "k1", RequestFingerprint.of(request), 1200, "EUR", NOW);
+diff --git a/src/test/java/com/orderflow/service/OrderStatusServiceTest.java b/src/test/java/com/orderflow/service/OrderStatusServiceTest.java
+index 32cf954..c9752b2 100644
+--- a/src/test/java/com/orderflow/service/OrderStatusServiceTest.java
++++ b/src/test/java/com/orderflow/service/OrderStatusServiceTest.java
+@@ -12,16 +12,18 @@ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
++import org.springframework.context.ApplicationEventPublisher;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.time.ZoneOffset;
+-import java.util.Optional;
+ import java.util.UUID;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+@@ -36,43 +38,56 @@ class OrderStatusServiceTest {
+     @Mock
+     OrderStatusHistoryRepository history;
+ 
++    @Mock
++    ApplicationEventPublisher events;
++
+     OrderStatusService service;
+ 
+     Order order;
+ 
+     @BeforeEach
+     void setUp() {
+-        service = new OrderStatusService(orders, history, Clock.fixed(NOW, ZoneOffset.UTC));
++        service = new OrderStatusService(orders, history, events, Clock.fixed(NOW, ZoneOffset.UTC));
+         order = Order.create("cust-1", "k", "fp", 100, "USD", NOW.minusSeconds(60));
+     }
+ 
+     @Test
+     void appliesStatusAndRecordsHistory() {
+-        when(orders.findById(order.getId())).thenReturn(Optional.of(order));
+         Instant occurred = NOW.minusSeconds(5);
++        when(orders.existsById(order.getId())).thenReturn(true);
++        when(orders.applyStatusIfNewer(order.getId(), OrderStatus.PAID, 1, occurred, NOW)).thenReturn(1);
+ 
+         service.applyStatusUpdate(new OrderStatusEvent(order.getId(), OrderStatus.PAID, 1, occurred, "payments"));
+ 
+-        assertThat(order.getStatus()).isEqualTo(OrderStatus.PAID);
+-        assertThat(order.getLastEventSequence()).isEqualTo(1);
+-        assertThat(order.getStatusUpdatedAt()).isEqualTo(occurred);
+-        assertThat(order.getUpdatedAt()).isEqualTo(NOW);
+-
+         ArgumentCaptor<OrderStatusHistory> captor = ArgumentCaptor.forClass(OrderStatusHistory.class);
+         verify(history).save(captor.capture());
+         assertThat(captor.getValue().getStatus()).isEqualTo(OrderStatus.PAID);
+         assertThat(captor.getValue().getEventSequence()).isEqualTo(1);
++        assertThat(captor.getValue().getOccurredAt()).isEqualTo(occurred);
++        assertThat(captor.getValue().getRecordedAt()).isEqualTo(NOW);
+         assertThat(captor.getValue().getSource()).isEqualTo("payments");
++        verify(events).publishEvent(new OrderStatusApplied(order.getId()));
++    }
++
++    @Test
++    void lateOrDuplicateEventIsIgnored() {
++        when(orders.existsById(order.getId())).thenReturn(true);
++        when(orders.applyStatusIfNewer(eq(order.getId()), any(), eq(2L), any(), any())).thenReturn(0);
++
++        service.applyStatusUpdate(new OrderStatusEvent(order.getId(), OrderStatus.PICKING, 2, NOW, "wms"));
++
++        verify(history, never()).save(any());
++        verify(events, never()).publishEvent(any(Object.class));
+     }
+ 
+     @Test
+     void unknownOrderThrows() {
+         UUID missing = UUID.randomUUID();
+-        when(orders.findById(missing)).thenReturn(Optional.empty());
++        when(orders.existsById(missing)).thenReturn(false);
+ 
+         assertThatThrownBy(() -> service.applyStatusUpdate(
+                 new OrderStatusEvent(missing, OrderStatus.PAID, 1, NOW, "payments")))
+                 .isInstanceOf(OrderNotFoundException.class);
+-        verify(history, org.mockito.Mockito.never()).save(any());
++        verify(history, never()).save(any());
+     }
+ }
