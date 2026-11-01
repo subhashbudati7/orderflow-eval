@@ -1,0 +1,28 @@
+{
+  "note": "Adds the unique index and returns 409 on collision. Stops the duplicate rows but breaks the replay contract under concurrency. Touches nothing else.",
+  "patch": "patches/incomplete/01-unique-index-409.patch",
+  "expected": {
+    "passed": false,
+    "must_fail": [
+      "IDEM-05",
+      "ORD-01",
+      "ORD-02",
+      "ORD-03",
+      "CACHE-01"
+    ],
+    "must_pass": [
+      "IDEM-01",
+      "IDEM-02",
+      "IDEM-03",
+      "IDEM-04",
+      "ORD-04",
+      "ORD-05",
+      "ORD-06",
+      "CACHE-02",
+      "CACHE-03",
+      "API-01",
+      "API-02",
+      "UNIT-01"
+    ]
+  }
+}

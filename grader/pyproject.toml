@@ -1,0 +1,18 @@
+[project]
+name = "orderflow-grader"
+version = "0.3.0"
+description = "Integration grader for the orderflow distributed-systems debugging task"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "confluent-kafka>=2.3",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["grader/scenarios"]
+markers = [
+    "scenario(id): grader scenario id, see grader/scoring.py",
+]

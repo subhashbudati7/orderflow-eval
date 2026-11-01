@@ -1,0 +1,27 @@
+{
+  "note": "Second correct fix with different techniques: INSERT ... ON CONFLICT, conditional UPDATE for the sequence guard, write-through cache via a transactional event listener.",
+  "patch": "patches/alt-fix.patch",
+  "expected": {
+    "passed": true,
+    "must_fail": [],
+    "must_pass": [
+      "IDEM-01",
+      "IDEM-02",
+      "IDEM-03",
+      "IDEM-04",
+      "IDEM-05",
+      "ORD-01",
+      "ORD-02",
+      "ORD-03",
+      "ORD-04",
+      "ORD-05",
+      "ORD-06",
+      "CACHE-01",
+      "CACHE-02",
+      "CACHE-03",
+      "API-01",
+      "API-02",
+      "UNIT-01"
+    ]
+  }
+}
