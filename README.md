@@ -122,5 +122,5 @@ verdict against `grader/expected/`. If a scenario starts failing on
 - [x] environment: service, compose stack, docs, bug report
 - [x] grader: 16 scenarios, runner, validation harness, scoring unit tests
 - [x] patches: reference, alternative, five incomplete, expected outcomes
-- [ ] `make validate` green on a machine with Docker (record the run folder here)
-- [ ] first agent attempts written up in `results/attempts/`
+- [x] `make validate` green on a machine with Docker (record the run folder here)
+- [x] first agent attempts written up in `results/attempts/`
