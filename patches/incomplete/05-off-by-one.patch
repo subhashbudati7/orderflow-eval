@@ -1,0 +1,329 @@
+diff --git a/src/main/java/com/orderflow/service/OrderService.java b/src/main/java/com/orderflow/service/OrderService.java
+index 9d71bee..c04aa61 100644
+--- a/src/main/java/com/orderflow/service/OrderService.java
++++ b/src/main/java/com/orderflow/service/OrderService.java
+@@ -6,8 +6,8 @@ import com.orderflow.domain.OrderRepository;
+ import com.orderflow.messaging.OrderEventPublisher;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.stereotype.Service;
+-import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+@@ -28,31 +28,45 @@ public class OrderService {
+         this.clock = clock;
+     }
+ 
+-    @Transactional
++    /**
++     * Deliberately not @Transactional. The repository save runs in its own
++     * short transaction so that (a) the unique index on idempotency_key is the
++     * thing that decides who wins a concurrent retry, and (b) we only publish
++     * OrderCreated once the row is actually committed.
++     */
+     public CreateOrderResult createOrder(String idempotencyKey, CreateOrderRequest request) {
+         String fingerprint = RequestFingerprint.of(request);
+ 
+         Optional<Order> existing = orders.findByIdempotencyKey(idempotencyKey);
+         if (existing.isPresent()) {
+-            Order found = existing.get();
+-            if (!found.getRequestFingerprint().equals(fingerprint)) {
+-                throw new IdempotencyKeyReusedException(idempotencyKey);
+-            }
+-            log.debug("replaying order {} for key {}", found.getId(), idempotencyKey);
+-            return CreateOrderResult.replay(found);
++            return replay(existing.get(), fingerprint, idempotencyKey);
+         }
+ 
+         Instant now = clock.instant();
+         Order order = Order.create(request.customerId(), idempotencyKey, fingerprint,
+                 request.totalCents(), request.currency(), now);
+ 
+-        // Downstream (fulfillment, notifications) must hear about the order before
+-        // we answer the client, otherwise a fast follow-up status event can arrive
+-        // for an order nobody knows about yet.
+-        publisher.publishOrderCreated(order);
++        try {
++            orders.save(order);
++        } catch (DataIntegrityViolationException e) {
++            // Lost the race with a concurrent retry. Postgres held our INSERT until
++            // the winner committed, so its row is visible now.
++            Order winner = orders.findByIdempotencyKey(idempotencyKey)
++                    .orElseThrow(() -> e);
++            log.info("concurrent retry for key {} resolved to order {}", idempotencyKey, winner.getId());
++            return replay(winner, fingerprint, idempotencyKey);
++        }
+ 
+-        orders.save(order);
++        publisher.publishOrderCreated(order);
+         log.info("created order {} for customer {}", order.getId(), order.getCustomerId());
+         return CreateOrderResult.created(order);
+     }
++
++    private CreateOrderResult replay(Order found, String fingerprint, String idempotencyKey) {
++        if (!found.getRequestFingerprint().equals(fingerprint)) {
++            throw new IdempotencyKeyReusedException(idempotencyKey);
++        }
++        log.debug("replaying order {} for key {}", found.getId(), idempotencyKey);
++        return CreateOrderResult.replay(found);
++    }
+ }
+diff --git a/src/main/java/com/orderflow/service/OrderStatusService.java b/src/main/java/com/orderflow/service/OrderStatusService.java
+index 873c63e..31cedae 100644
+--- a/src/main/java/com/orderflow/service/OrderStatusService.java
++++ b/src/main/java/com/orderflow/service/OrderStatusService.java
+@@ -7,9 +7,12 @@ import com.orderflow.domain.OrderStatusHistoryRepository;
+ import com.orderflow.messaging.OrderStatusEvent;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+-import org.springframework.cache.annotation.CacheEvict;
++import org.springframework.cache.Cache;
++import org.springframework.cache.CacheManager;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+@@ -26,11 +29,14 @@ public class OrderStatusService {
+ 
+     private final OrderRepository orders;
+     private final OrderStatusHistoryRepository history;
++    private final CacheManager cacheManager;
+     private final Clock clock;
+ 
+-    public OrderStatusService(OrderRepository orders, OrderStatusHistoryRepository history, Clock clock) {
++    public OrderStatusService(OrderRepository orders, OrderStatusHistoryRepository history,
++                              CacheManager cacheManager, Clock clock) {
+         this.orders = orders;
+         this.history = history;
++        this.cacheManager = cacheManager;
+         this.clock = clock;
+     }
+ 
+@@ -39,6 +45,14 @@ public class OrderStatusService {
+         Order order = orders.findById(event.orderId())
+                 .orElseThrow(() -> new OrderNotFoundException(event.orderId()));
+ 
++        // Topic is at-least-once and not ordered across producers. Anything at or
++        // below what we already applied is a redelivery or a late arrival.
++        if (event.sequence() < order.getLastEventSequence()) {
++            log.info("ignoring status event seq {} ({}) for order {}: already at seq {}",
++                    event.sequence(), event.status(), order.getId(), order.getLastEventSequence());
++            return;
++        }
++
+         Instant now = clock.instant();
+         order.applyStatus(event.status(), event.sequence(), event.occurredAt(), now);
+         orders.save(order);
+@@ -46,13 +60,30 @@ public class OrderStatusService {
+         history.save(new OrderStatusHistory(order.getId(), event.status(), event.sequence(),
+                 event.occurredAt(), now, event.source()));
+ 
+-        evictCachedOrder(order.getId());
++        // Evict after commit. Evicting inside the transaction leaves a window where
++        // a concurrent GET re-populates the cache from the not-yet-committed (old) row.
++        afterCommit(() -> evictCachedOrder(order.getId()));
+         log.info("order {} -> {} (seq {})", order.getId(), event.status(), event.sequence());
+     }
+ 
+-    @CacheEvict(value = OrderQueryService.ORDERS_CACHE, key = "#orderId")
+-    public void evictCachedOrder(UUID orderId) {
+-        // Eviction is handled by the annotation; nothing else to do here.
+-        log.debug("evicted cached order {}", orderId);
++    private void evictCachedOrder(UUID orderId) {
++        Cache cache = cacheManager.getCache(OrderQueryService.ORDERS_CACHE);
++        if (cache != null) {
++            cache.evict(orderId);
++            log.debug("evicted cached order {}", orderId);
++        }
++    }
++
++    private static void afterCommit(Runnable action) {
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++                @Override
++                public void afterCommit() {
++                    action.run();
++                }
++            });
++        } else {
++            action.run();
++        }
+     }
+ }
+diff --git a/src/main/resources/db/migration/V2__orders_idempotency_key_unique.sql b/src/main/resources/db/migration/V2__orders_idempotency_key_unique.sql
+new file mode 100644
+index 0000000..4d110fb
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__orders_idempotency_key_unique.sql
+@@ -0,0 +1,5 @@
++-- One order per idempotency key, enforced by the database. The application
++-- check in OrderService was a find-then-insert and lost the race under
++-- concurrent retries (ORD-2291).
++DROP INDEX IF EXISTS idx_orders_idempotency_key;
++CREATE UNIQUE INDEX uq_orders_idempotency_key ON orders (idempotency_key);
+diff --git a/src/test/java/com/orderflow/service/OrderServiceTest.java b/src/test/java/com/orderflow/service/OrderServiceTest.java
+index e27fb31..f3fdde5 100644
+--- a/src/test/java/com/orderflow/service/OrderServiceTest.java
++++ b/src/test/java/com/orderflow/service/OrderServiceTest.java
+@@ -19,6 +19,8 @@ import java.util.Optional;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
++import org.springframework.dao.DataIntegrityViolationException;
++
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+@@ -73,6 +75,33 @@ class OrderServiceTest {
+         verify(orders, never()).save(any());
+     }
+ 
++    @Test
++    void losingTheInsertRaceReplaysTheWinner() {
++        Order winner = Order.create("cust-7", "k1", RequestFingerprint.of(request), 1200, "EUR", NOW);
++        when(orders.findByIdempotencyKey("k1"))
++                .thenReturn(Optional.empty())           // nothing there when we look
++                .thenReturn(Optional.of(winner));       // the other request committed meanwhile
++        when(orders.save(any())).thenThrow(new DataIntegrityViolationException("uq_orders_idempotency_key"));
++
++        CreateOrderResult result = service.createOrder("k1", request);
++
++        assertThat(result.replayed()).isTrue();
++        assertThat(result.order()).isSameAs(winner);
++        verify(publisher, never()).publishOrderCreated(any());
++    }
++
++    @Test
++    void publishesOnlyAfterTheRowIsSaved() {
++        when(orders.findByIdempotencyKey("k1")).thenReturn(Optional.empty());
++        when(orders.save(any())).thenAnswer(inv -> inv.getArgument(0));
++
++        service.createOrder("k1", request);
++
++        var inOrder = org.mockito.Mockito.inOrder(orders, publisher);
++        inOrder.verify(orders).save(any());
++        inOrder.verify(publisher).publishOrderCreated(any());
++    }
++
+     @Test
+     void sameKeyDifferentBodyIsRejected() {
+         Order existing = Order.create("cust-7", "k1", "some-other-fingerprint", 999, "EUR", NOW);
+diff --git a/src/test/java/com/orderflow/service/OrderStatusServiceTest.java b/src/test/java/com/orderflow/service/OrderStatusServiceTest.java
+index 32cf954..34d9e35 100644
+--- a/src/test/java/com/orderflow/service/OrderStatusServiceTest.java
++++ b/src/test/java/com/orderflow/service/OrderStatusServiceTest.java
+@@ -1,5 +1,6 @@
+ package com.orderflow.service;
+ 
++import com.orderflow.api.OrderResponse;
+ import com.orderflow.domain.Order;
+ import com.orderflow.domain.OrderRepository;
+ import com.orderflow.domain.OrderStatus;
+@@ -12,6 +13,8 @@ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.junit.jupiter.MockitoExtension;
++import org.springframework.cache.CacheManager;
++import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+@@ -22,6 +25,7 @@ import java.util.UUID;
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+@@ -36,16 +40,22 @@ class OrderStatusServiceTest {
+     @Mock
+     OrderStatusHistoryRepository history;
+ 
++    CacheManager cacheManager = new ConcurrentMapCacheManager(OrderQueryService.ORDERS_CACHE);
++
+     OrderStatusService service;
+ 
+     Order order;
+ 
+     @BeforeEach
+     void setUp() {
+-        service = new OrderStatusService(orders, history, Clock.fixed(NOW, ZoneOffset.UTC));
++        service = new OrderStatusService(orders, history, cacheManager, Clock.fixed(NOW, ZoneOffset.UTC));
+         order = Order.create("cust-1", "k", "fp", 100, "USD", NOW.minusSeconds(60));
+     }
+ 
++    private OrderStatusEvent event(OrderStatus status, long seq) {
++        return new OrderStatusEvent(order.getId(), status, seq, NOW.minusSeconds(5), "payments");
++    }
++
+     @Test
+     void appliesStatusAndRecordsHistory() {
+         when(orders.findById(order.getId())).thenReturn(Optional.of(order));
+@@ -65,6 +75,53 @@ class OrderStatusServiceTest {
+         assertThat(captor.getValue().getSource()).isEqualTo("payments");
+     }
+ 
++    @Test
++    void lateEventWithLowerSequenceIsIgnored() {
++        order.applyStatus(OrderStatus.SHIPPED, 3, NOW.minusSeconds(30), NOW.minusSeconds(30));
++        when(orders.findById(order.getId())).thenReturn(Optional.of(order));
++
++        service.applyStatusUpdate(event(OrderStatus.PICKING, 2));
++
++        assertThat(order.getStatus()).isEqualTo(OrderStatus.SHIPPED);
++        assertThat(order.getLastEventSequence()).isEqualTo(3);
++        verify(history, never()).save(any());
++        verify(orders, never()).save(any());
++    }
++
++    @Test
++    void cancelAfterShippedIsApplied() {
++        order.applyStatus(OrderStatus.SHIPPED, 3, NOW.minusSeconds(30), NOW.minusSeconds(30));
++        when(orders.findById(order.getId())).thenReturn(Optional.of(order));
++
++        service.applyStatusUpdate(event(OrderStatus.CANCELLED, 4));
++
++        assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
++        assertThat(order.getLastEventSequence()).isEqualTo(4);
++    }
++
++    @Test
++    void appliedEventEvictsCachedOrder() {
++        var cache = cacheManager.getCache(OrderQueryService.ORDERS_CACHE);
++        cache.put(order.getId(), OrderResponse.from(order));
++        when(orders.findById(order.getId())).thenReturn(Optional.of(order));
++
++        service.applyStatusUpdate(event(OrderStatus.PAID, 1));
++
++        assertThat(cache.get(order.getId())).isNull();
++    }
++
++    @Test
++    void ignoredEventLeavesCacheAlone() {
++        order.applyStatus(OrderStatus.SHIPPED, 3, NOW.minusSeconds(30), NOW.minusSeconds(30));
++        var cache = cacheManager.getCache(OrderQueryService.ORDERS_CACHE);
++        cache.put(order.getId(), OrderResponse.from(order));
++        when(orders.findById(order.getId())).thenReturn(Optional.of(order));
++
++        service.applyStatusUpdate(event(OrderStatus.PICKING, 2));
++
++        assertThat(cache.get(order.getId())).isNotNull();
++    }
++
+     @Test
+     void unknownOrderThrows() {
+         UUID missing = UUID.randomUUID();
+@@ -73,6 +130,6 @@ class OrderStatusServiceTest {
+         assertThatThrownBy(() -> service.applyStatusUpdate(
+                 new OrderStatusEvent(missing, OrderStatus.PAID, 1, NOW, "payments")))
+                 .isInstanceOf(OrderNotFoundException.class);
+-        verify(history, org.mockito.Mockito.never()).save(any());
++        verify(history, never()).save(any());
+     }
+ }

@@ -1,0 +1,86 @@
+diff --git a/src/main/java/com/orderflow/api/ApiErrors.java b/src/main/java/com/orderflow/api/ApiErrors.java
+index eca5637..16d6cbc 100644
+--- a/src/main/java/com/orderflow/api/ApiErrors.java
++++ b/src/main/java/com/orderflow/api/ApiErrors.java
+@@ -1,6 +1,7 @@
+ package com.orderflow.api;
+ 
+ import com.orderflow.service.IdempotencyKeyReusedException;
++import com.orderflow.service.OrderConflictException;
+ import com.orderflow.service.OrderNotFoundException;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+@@ -29,6 +30,12 @@ public class ApiErrors {
+                 .body(new ErrorBody("IDEMPOTENCY_KEY_REUSED", e.getMessage()));
+     }
+ 
++    @ExceptionHandler(OrderConflictException.class)
++    ResponseEntity<ErrorBody> conflict(OrderConflictException e) {
++        return ResponseEntity.status(HttpStatus.CONFLICT)
++                .body(new ErrorBody("ORDER_ALREADY_EXISTS", e.getMessage()));
++    }
++
+     @ExceptionHandler(MissingRequestHeaderException.class)
+     ResponseEntity<ErrorBody> missingHeader(MissingRequestHeaderException e) {
+         return ResponseEntity.badRequest()
+diff --git a/src/main/java/com/orderflow/service/OrderConflictException.java b/src/main/java/com/orderflow/service/OrderConflictException.java
+new file mode 100644
+index 0000000..df89c05
+--- /dev/null
++++ b/src/main/java/com/orderflow/service/OrderConflictException.java
+@@ -0,0 +1,8 @@
++package com.orderflow.service;
++
++public class OrderConflictException extends RuntimeException {
++
++    public OrderConflictException(String key) {
++        super("an order for Idempotency-Key '" + key + "' already exists");
++    }
++}
+diff --git a/src/main/java/com/orderflow/service/OrderService.java b/src/main/java/com/orderflow/service/OrderService.java
+index 9d71bee..68d6929 100644
+--- a/src/main/java/com/orderflow/service/OrderService.java
++++ b/src/main/java/com/orderflow/service/OrderService.java
+@@ -6,8 +6,8 @@ import com.orderflow.domain.OrderRepository;
+ import com.orderflow.messaging.OrderEventPublisher;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.stereotype.Service;
+-import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.time.Clock;
+ import java.time.Instant;
+@@ -28,7 +28,6 @@ public class OrderService {
+         this.clock = clock;
+     }
+ 
+-    @Transactional
+     public CreateOrderResult createOrder(String idempotencyKey, CreateOrderRequest request) {
+         String fingerprint = RequestFingerprint.of(request);
+ 
+@@ -51,7 +50,12 @@ public class OrderService {
+         // for an order nobody knows about yet.
+         publisher.publishOrderCreated(order);
+ 
+-        orders.save(order);
++        try {
++            orders.save(order);
++        } catch (DataIntegrityViolationException e) {
++            // Another request with the same key got there first (unique index from V2).
++            throw new OrderConflictException(idempotencyKey);
++        }
+         log.info("created order {} for customer {}", order.getId(), order.getCustomerId());
+         return CreateOrderResult.created(order);
+     }
+diff --git a/src/main/resources/db/migration/V2__orders_idempotency_key_unique.sql b/src/main/resources/db/migration/V2__orders_idempotency_key_unique.sql
+new file mode 100644
+index 0000000..4d110fb
+--- /dev/null
++++ b/src/main/resources/db/migration/V2__orders_idempotency_key_unique.sql
+@@ -0,0 +1,5 @@
++-- One order per idempotency key, enforced by the database. The application
++-- check in OrderService was a find-then-insert and lost the race under
++-- concurrent retries (ORD-2291).
++DROP INDEX IF EXISTS idx_orders_idempotency_key;
++CREATE UNIQUE INDEX uq_orders_idempotency_key ON orders (idempotency_key);
